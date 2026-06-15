@@ -18,33 +18,110 @@ from agent import run_agent
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
-# ── query handler ─────────────────────────────────────────────────────────────
+# ── Style Keywords & Query Handler ───────────────────────────────────────────
 
-def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
+import re
+
+STYLE_KEYWORDS = {
+    "grunge", "y2k", "baggy", "vintage", "classic", "denim", "streetwear", 
+    "cottagecore", "flannel", "layering", "athletic", "earth tones", "70s", 
+    "band tee", "goth", "platform", "90s", "color block", "cargo", "2000s", 
+    "feminine", "floral", "western", "summer", "minimal", "cozy", "oversized", 
+    "knitwear", "preppy", "dark academia", "workwear", "statement", "glam", 
+    "customized", "rock", "tie-dye", "colorful"
+}
+
+def handle_query(user_query: str, wardrobe_choice: str, state_memory: str) -> tuple[str, str, str, str, str, any]:
     """
     Called by Gradio when the user submits a query.
 
     Args:
         user_query:     The text the user typed into the search box.
         wardrobe_choice: Either "Example wardrobe" or "Empty wardrobe (new user)".
+        state_memory:   The accumulated style preferences string from gr.State.
 
     Returns:
-        A tuple of three strings:
-            (listing_text, outfit_suggestion, fit_card)
-        Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
+        A tuple of values mapping to the UI outputs.
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    if state_memory is None:
+        state_memory = ""
+
+    # 1. Guard against empty/whitespace query
+    if not user_query or not user_query.strip():
+        return (
+            "Please enter what you are looking for to begin! 🛍️", 
+            "N/A", 
+            "N/A", 
+            state_memory, 
+            state_memory, 
+            gr.update(visible=False, value="")
+        )
+
+    # 2. Extract style keywords and update memory state
+    query_lower = user_query.lower()
+    extracted_keywords = []
+    for kw in STYLE_KEYWORDS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', query_lower):
+            extracted_keywords.append(kw)
+            
+    if extracted_keywords:
+        existing_keywords = [k.strip() for k in state_memory.split(",") if k.strip()]
+        for kw in extracted_keywords:
+            if kw not in existing_keywords:
+                existing_keywords.append(kw)
+        state_memory = ", ".join(existing_keywords)
+
+    # 3. Determine empty wardrobe flag
+    use_empty_wardrobe = (wardrobe_choice == "Empty wardrobe (new user)")
+
+    # 4. Call run_agent
+    session = run_agent(user_query, use_empty_wardrobe=use_empty_wardrobe, style_memory=state_memory)
+
+    # 5. Handle early errors/abort
+    if session.get("error"):
+        return (
+            session["error"], 
+            "N/A", 
+            "N/A", 
+            state_memory, 
+            state_memory, 
+            gr.update(visible=False, value="")
+        )
+
+    # 6. Format successful result
+    item = session["selected_item"]
+    if not item:
+        return (
+            "No item was selected.", 
+            "N/A", 
+            "N/A", 
+            state_memory, 
+            state_memory, 
+            gr.update(visible=False, value="")
+        )
+
+    brand = item.get("brand") or "N/A"
+    listing_text = (
+        f"Title: {item.get('title')}\n"
+        f"Brand: {brand}\n"
+        f"Price: ${item.get('price'):.2f}\n"
+        f"Condition: {item.get('condition')}\n"
+        f"Platform: {item.get('platform')}"
+    )
+    if session.get("price_comparison"):
+        listing_text += f"\n\nPrice Evaluation:\n{session['price_comparison']}"
+
+    warning = session.get("warning")
+    warning_update = gr.update(value=warning, visible=True) if warning else gr.update(value="", visible=False)
+
+    return (
+        listing_text,
+        session.get("outfit_suggestion") or "",
+        session.get("fit_card") or "",
+        state_memory,
+        state_memory,
+        warning_update
+    )
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
@@ -65,6 +142,17 @@ Find secondhand pieces and get outfit ideas based on your wardrobe.
 Describe what you're looking for — include size and price if you want to filter.
         """)
 
+        # gr.State stores historical user style profile memory
+        memory_state = gr.State(value="")
+
+        # Warning output banner (rendered if retry logic triggered)
+        warning_output = gr.Textbox(
+            label="⚠️ Notice",
+            value="",
+            visible=False,
+            interactive=False,
+        )
+
         with gr.Row():
             query_input = gr.Textbox(
                 label="What are you looking for?",
@@ -78,6 +166,14 @@ Describe what you're looking for — include size and price if you want to filte
                 label="Wardrobe",
                 scale=1,
             )
+
+        # Style preferences tracker element
+        style_memory_display = gr.Textbox(
+            label="🧠 Remembered Style Preferences (Persistent Profile Memory)",
+            value="",
+            interactive=False,
+            placeholder="No style preferences remembered yet. (e.g. y2k, grunge, baggy)"
+        )
 
         submit_btn = gr.Button("Find it", variant="primary")
 
@@ -104,15 +200,16 @@ Describe what you're looking for — include size and price if you want to filte
             label="Try these queries",
         )
 
+        # Submit handlers
         submit_btn.click(
             fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
+            inputs=[query_input, wardrobe_choice, memory_state],
+            outputs=[listing_output, outfit_output, fitcard_output, memory_state, style_memory_display, warning_output],
         )
         query_input.submit(
             fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
+            inputs=[query_input, wardrobe_choice, memory_state],
+            outputs=[listing_output, outfit_output, fitcard_output, memory_state, style_memory_display, warning_output],
         )
 
     return demo
