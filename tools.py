@@ -55,27 +55,67 @@ def search_listings(
     Returns:
         A list of matching listing dicts, sorted by relevance (best match first).
         Returns an empty list if nothing matches — does NOT raise an exception.
-
-    Each listing dict has the following fields:
-        id, title, description, category, style_tags (list), size,
-        condition, price (float), colors (list), brand, platform
-
-    TODO:
-        1. Load all listings with load_listings().
-        2. Filter by max_price and size (if provided).
-        3. Score each remaining listing by keyword overlap with `description`.
-        4. Drop any listings with a score of 0 (no relevant matches).
-        5. Sort by score, highest first, and return the listing dicts.
-
-    Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    
+    # Split description into lowercase keywords
+    keywords = [kw.lower() for kw in description.split()] if description else []
+    
+    results = []
+    for item in listings:
+        # Price filter
+        if max_price is not None:
+            if item.get("price", 0.0) > max_price:
+                continue
+                
+        # Size filter (flexible case-insensitive match)
+        if size is not None:
+            size_clean = size.strip().lower()
+            item_size = item.get("size", "").lower()
+            item_tags = [t.lower() for t in item.get("style_tags", [])]
+            if size_clean not in item_size and size_clean not in item_tags:
+                continue
+                
+        # Keyword matching
+        if keywords:
+            title_lower = item.get("title", "").lower()
+            desc_lower = item.get("description", "").lower()
+            tags_lower = [t.lower() for t in item.get("style_tags", [])]
+            
+            score = 0
+            for kw in keywords:
+                if kw in title_lower or kw in desc_lower or any(kw in tag for tag in tags_lower):
+                    score += 1
+                    
+            if score == 0:
+                continue
+                
+            item_copy = item.copy()
+            item_copy["_score"] = score
+            results.append(item_copy)
+        else:
+            item_copy = item.copy()
+            item_copy["_score"] = 1
+            results.append(item_copy)
+            
+    # Sort results by score (descending)
+    results.sort(key=lambda x: x["_score"], reverse=True)
+    
+    # Strip the internal sorting key
+    for r in results:
+        r.pop("_score", None)
+        
+    return results
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
 
-def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
+def suggest_outfit(
+    new_item: dict,
+    wardrobe: dict,
+    style_memory: str = "",
+    trend_summary: str = "",
+) -> str:
     """
     Given a thrifted item and the user's wardrobe, suggest 1–2 complete outfits.
 
@@ -83,25 +123,62 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
         new_item: A listing dict (the item the user is considering buying).
         wardrobe: A wardrobe dict with an 'items' key containing a list of
                   wardrobe item dicts. May be empty — handle this gracefully.
+        style_memory: Historical user style preferences to respect.
+        trend_summary: Trend information to incorporate.
 
     Returns:
         A non-empty string with outfit suggestions.
         If the wardrobe is empty, offer general styling advice for the item
         rather than raising an exception or returning an empty string.
-
-    TODO:
-        1. Check whether wardrobe['items'] is empty.
-        2. If empty: call the LLM with a prompt for general styling ideas
-           (what kinds of items pair well, what vibe it suits, etc.).
-        3. If not empty: format the wardrobe items into a prompt and ask
-           the LLM to suggest specific outfit combinations using the new item
-           and named pieces from the wardrobe.
-        4. Return the LLM's response as a string.
-
-    Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+    
+    # Check if wardrobe['items'] is empty
+    is_empty = not wardrobe or not wardrobe.get("items")
+    
+    if is_empty:
+        # Prompt for general versatile styling advice
+        prompt = (
+            f"Provide general, highly versatile styling tips, silhouette rules, and color coordination logic "
+            f"optimized for this clothing item category: '{new_item.get('category')}' (specifically: '{new_item.get('title')}').\n"
+            f"Description: {new_item.get('description')}\n"
+            f"Vibe/Style Tags: {new_item.get('style_tags')}\n"
+        )
+    else:
+        # Format wardrobe items
+        wardrobe_list = []
+        for item in wardrobe["items"]:
+            colors = ", ".join(item.get("colors", []))
+            tags = ", ".join(item.get("style_tags", []))
+            notes = f" ({item.get('notes')})" if item.get("notes") else ""
+            wardrobe_list.append(f"- {item.get('name')} in {colors} [style tags: {tags}]{notes}")
+        wardrobe_str = "\n".join(wardrobe_list)
+        
+        prompt = (
+            f"The user is looking to style a new item: '{new_item.get('title')}' (${new_item.get('price'):.2f} on {new_item.get('platform')}).\n"
+            f"Description: {new_item.get('description')}\n"
+            f"Vibe/Style Tags: {new_item.get('style_tags')}\n\n"
+            f"The user's current wardrobe contains these items:\n{wardrobe_str}\n\n"
+            f"Suggest 1-2 complete outfit combinations mixing and matching the new item with named pieces from their existing wardrobe.\n"
+        )
+        
+    if style_memory:
+        prompt += f"\nRespect the user's historical style preferences/keywords: {style_memory}.\n"
+        
+    if trend_summary:
+        prompt += f"\nIncorporate the following trend insights into your suggestion: {trend_summary}.\n"
+        
+    prompt += "\nEnsure the suggestions are extremely aesthetic and versatile. Keep the entire response under 4 sentences total."
+        
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a professional fashion stylist and coordinator."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    return completion.choices[0].message.content.strip()
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -118,20 +195,108 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
         A 2–4 sentence string usable as an Instagram/TikTok caption.
         If outfit is empty or missing, return a descriptive error message
         string — do NOT raise an exception.
-
-    The caption should:
-    - Feel casual and authentic (like a real OOTD post, not a product description)
-    - Mention the item name, price, and platform naturally (once each)
-    - Capture the outfit vibe in specific terms
-    - Sound different each time for different inputs (use higher LLM temperature)
-
-    TODO:
-        1. Guard against an empty or whitespace-only outfit string.
-        2. Build a prompt that gives the LLM the item details and the outfit,
-           and asks for a caption matching the style guidelines above.
-        3. Call the LLM and return the response.
-
-    Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return "thrift find locked in! time to style it up. 🛍️✨"
+        
+    client = _get_groq_client()
+    
+    prompt = (
+        f"You are a social media trendsetter creating an aesthetic post caption.\n"
+        f"New Thrift Find: {new_item.get('title')} (${new_item.get('price'):.2f} on {new_item.get('platform')})\n"
+        f"Vibe/Style Tags: {new_item.get('style_tags')}\n"
+        f"Outfit Suggestion: {outfit}\n\n"
+        f"Write a casual, authentic, social-media-ready caption (like a real OOTD post, not a product description) "
+        f"based on the new thrift details and styling advice.\n"
+        f"Rules:\n"
+        f"- The caption must be strictly in lower-case letters.\n"
+        f"- Mention the item name, price, and platform naturally (exactly once each).\n"
+        f"- Include 1-2 relevant emojis.\n"
+        f"- Keep it short, between 2 and 4 sentences."
+    )
+    
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a creative, trendy social media copywriter. You write strictly in lowercase letters."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.95
+    )
+    
+    caption = completion.choices[0].message.content.strip()
+    return caption.lower()
+
+
+# ── Stretch Tool 4: compare_price ─────────────────────────────────────────────
+
+def compare_price(new_item: dict) -> str:
+    """
+    Load the listings and calculate average price of items in the same category
+    (and optionally brand if brand matches exist) and return a comparison message.
+    """
+    listings = load_listings()
+    category = new_item.get("category")
+    brand = new_item.get("brand")
+    
+    # Filter by category
+    comparable_items = [item for item in listings if item.get("category") == category]
+    
+    # Optionally filter by brand
+    if brand and str(brand).strip() not in ("", "None", "N/A"):
+        brand_clean = str(brand).strip().lower()
+        brand_filtered = [
+            item for item in comparable_items 
+            if item.get("brand") and item.get("brand").strip().lower() == brand_clean
+        ]
+        if brand_filtered:
+            comparable_items = brand_filtered
+            
+    if not comparable_items:
+        return f"No comparable items found to evaluate the price of this {category}."
+        
+    prices = [item.get("price", 0.0) for item in comparable_items]
+    avg_price = sum(prices) / len(prices)
+    new_price = new_item.get("price", 0.0)
+    
+    # Simple deal status logic
+    if new_price < avg_price * 0.9:  # significantly lower
+        deal_status = "a steal"
+    elif new_price > avg_price * 1.1:  # significantly higher
+        deal_status = "a bit above average"
+    else:
+        deal_status = "fairly priced"
+        
+    cat_display = category.lower() if category else "items"
+    
+    # Return formatted comparison message
+    return f"At ${new_price:.2f}, this is {deal_status} compared to the average ${avg_price:.2f} for similar {cat_display}."
+
+
+# ── Stretch Tool 5: get_trends ────────────────────────────────────────────────
+
+def get_trends(category: str) -> str:
+    """
+    Ask Groq LLM (llama-3.3-70b-versatile) to act as a fashion trend analyst
+    and summarize styling trends for the given category in contemporary streetwear.
+    """
+    client = _get_groq_client()
+    
+    prompt = (
+        f"Act as a fashion trend analyst.\n"
+        f"Return a 1-2 sentence summary of how items in the category '{category}' "
+        f"are currently being styled in contemporary streetwear and thrift culture.\n"
+        f"Keep the summary concise and direct."
+    )
+    
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a professional fashion trend analyst specializing in contemporary streetwear and thrift culture."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+    
+    return completion.choices[0].message.content.strip()
+
